@@ -55,6 +55,145 @@ sanitize_username() {
     echo "$raw" | tr 'A-Z' 'a-z' | tr '.@' '_' | tr -cd 'a-z0-9_-' | cut -c 1-32
 }
 
+is_selinux_enabled() {
+    if ! command -v getenforce &>/dev/null; then
+        return 1
+    fi
+
+    [ "$(getenforce 2>/dev/null)" != "Disabled" ]
+}
+
+allow_httpd_network_connect() {
+    info ">> SELinux: Allowing web server to make network connections..."
+
+    if ! is_selinux_enabled; then
+        warn "SELinux is disabled or unavailable. Skipping SELinux boolean configuration."
+        return 0
+    fi
+
+    if ! command -v getsebool &>/dev/null || ! getsebool -a 2>/dev/null | grep -q '^httpd_can_network_connect[[:space:]]'; then
+        warn "SELinux boolean 'httpd_can_network_connect' is not available on this system. Skipping."
+        return 0
+    fi
+
+    sudo setsebool -P httpd_can_network_connect on
+}
+
+set_webroot_selinux_context() {
+    local webroot="$1"
+    local mode="${2:-add}"
+
+    if ! is_selinux_enabled; then
+        warn "SELinux is disabled or unavailable. Skipping SELinux context update for $webroot."
+        return 0
+    fi
+
+    if ! command -v semanage &>/dev/null || ! command -v restorecon &>/dev/null; then
+        warn "SELinux management tools are not available. Skipping SELinux context update for $webroot."
+        return 0
+    fi
+
+    case "$mode" in
+        add)
+            sudo semanage fcontext -a -t httpd_sys_rw_content_t "$webroot(/.*)?" || \
+                sudo semanage fcontext -m -t httpd_sys_rw_content_t "$webroot(/.*)?"
+            sudo restorecon -R "$webroot"
+            ;;
+        delete)
+            sudo semanage fcontext -d "$webroot(/.*)?" || true
+            ;;
+        *)
+            warn "Unknown SELinux context mode '$mode' for $webroot."
+            ;;
+    esac
+}
+
+configure_nftables_fallback() {
+    if ! command -v nft &>/dev/null; then
+        return 1
+    fi
+
+    info "Trying firewall fallback with nftables..."
+
+    if ! sudo nft list table inet filter >/dev/null 2>&1; then
+        sudo nft add table inet filter
+    fi
+
+    if ! sudo nft list chain inet filter input >/dev/null 2>&1; then
+        sudo nft add chain inet filter input '{ type filter hook input priority 0; policy accept; }'
+    fi
+
+    if ! sudo nft list chain inet filter input | grep -q 'tcp dport 80 accept'; then
+        sudo nft add rule inet filter input tcp dport 80 accept
+    fi
+
+    if ! sudo nft list chain inet filter input | grep -q 'tcp dport 443 accept'; then
+        sudo nft add rule inet filter input tcp dport 443 accept
+    fi
+
+    success "Opened HTTP/HTTPS ports with nftables."
+    return 0
+}
+
+configure_iptables_fallback() {
+    if ! command -v iptables &>/dev/null; then
+        return 1
+    fi
+
+    info "Trying firewall fallback with iptables..."
+
+    if ! sudo iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1; then
+        sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+    fi
+
+    if ! sudo iptables -C INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1; then
+        sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+    fi
+
+    success "Opened HTTP/HTTPS ports with iptables."
+    warn "iptables rules were applied in runtime only. Save them manually if you need persistence after reboot."
+    return 0
+}
+
+configure_firewall() {
+    info "Checking and configuring firewall..."
+
+    if ! command -v systemctl &>/dev/null; then
+        warn "systemctl is not available on this system. Skipping firewalld and trying direct firewall fallback."
+        configure_nftables_fallback || configure_iptables_fallback || warn "No supported firewall tool was configured automatically."
+        return 0
+    fi
+
+    if ! command -v firewall-cmd &>/dev/null; then
+        warn "firewalld not installed. Installing..."
+        sudo dnf install -y firewalld
+    fi
+
+    if ! sudo systemctl enable firewalld >/dev/null 2>&1; then
+        warn "Could not enable firewalld service automatically."
+    fi
+
+    if ! sudo systemctl is-active --quiet firewalld; then
+        warn "firewalld is installed but not running. Attempting to start service..."
+        if ! sudo systemctl start firewalld; then
+            warn "Could not start firewalld. Trying fallback firewall configuration."
+            configure_nftables_fallback || configure_iptables_fallback || warn "HTTP/HTTPS ports were not opened automatically."
+            return 0
+        fi
+    fi
+
+    if ! sudo firewall-cmd --state >/dev/null 2>&1; then
+        warn "firewalld command is available but daemon is not ready. Trying fallback firewall configuration."
+        configure_nftables_fallback || configure_iptables_fallback || warn "HTTP/HTTPS ports were not opened automatically."
+        return 0
+    fi
+
+    sudo firewall-cmd --permanent --add-service=http
+    sudo firewall-cmd --permanent --add-service=https
+    sudo firewall-cmd --reload
+    success "firewalld is running and HTTP/HTTPS services were allowed."
+}
+
 # --- MAIN FUNCTIONS ---
 create_swap_if_needed() {
     if sudo swapon --show | grep -q '/'; then
@@ -131,26 +270,9 @@ install_lemp() {
         sudo sed -i '/http {/a \    client_max_body_size 512M;' "$nginx_conf_path"
     fi
 
-    info "Checking and configuring firewall (firewalld)..."
-    if ! command -v firewall-cmd &>/dev/null; then
-        warn "firewalld not installed. Installing..."
-        sudo dnf install -y firewalld
-        sudo systemctl enable --now firewalld
-        success "firewalld has been installed and activated."
-    else
-        if ! sudo systemctl is-active --quiet firewalld; then
-            sudo systemctl start firewalld
-        fi
-        info "firewalld is already installed. Ready for configuration."
-    fi
+    configure_firewall
 
-    sudo firewall-cmd --permanent --add-service=http
-    sudo firewall-cmd --permanent --add-service=https
-    sudo firewall-cmd --reload
-
-    # === NEW: Allow web server to make outgoing network connections ===
-    info ">> SELinux: Allowing web server to make network connections..."
-    sudo setsebool -P httpd_can_network_connect on
+    allow_httpd_network_connect
 
     info "Starting and enabling main services..."
     sudo systemctl enable --now nginx mariadb php-fpm crond
@@ -246,8 +368,7 @@ create_site() {
     tar -xzf /tmp/latest.tar.gz -C /tmp && sudo cp -r /tmp/wordpress/* "$webroot" && sudo chown -R "$site_user":nginx "$webroot"
 
     info ">> SELinux: Setting context for webroot..."
-    sudo semanage fcontext -a -t httpd_sys_rw_content_t "$webroot(/.*)?"
-    sudo restorecon -R "$webroot"
+    set_webroot_selinux_context "$webroot"
 
     info "Creating Database and User..."
     sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -423,7 +544,7 @@ delete_site() {
     sleep 1
 
     info ">> SELinux: Removing webroot context..."
-    sudo semanage fcontext -d "$webroot(/.*)?" || true
+    set_webroot_selinux_context "$webroot" delete
 
     info "Deleting system user and webroot..."
     if id -u "$site_user" >/dev/null 2>&1; then
@@ -500,8 +621,7 @@ clone_site() {
     sudo chown -R "$new_site_user":nginx "$new_webroot"
 
     info ">> SELinux: Assigning context for new webroot..."
-    sudo semanage fcontext -a -t httpd_sys_rw_content_t "$new_webroot(/.*)?"
-    sudo restorecon -R "$new_webroot"
+    set_webroot_selinux_context "$new_webroot"
 
     info "Creating and copying database..."
     sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -818,8 +938,7 @@ chmod_site_permissions() {
 
     # Set SELinux context (already handled during site creation, but good to re-apply)
     info ">> SELinux: Re-applying context for webroot..."
-    sudo semanage fcontext -a -t httpd_sys_rw_content_t "$webroot(/.*)?" || true
-    sudo restorecon -R "$webroot"
+    set_webroot_selinux_context "$webroot"
 
     success "Permissions for site '$domain' have been set to recommended WordPress values."
     warn "It's always recommended to check your specific WordPress setup for any custom permission requirements."
