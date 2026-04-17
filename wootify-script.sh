@@ -71,12 +71,13 @@ allow_httpd_network_connect() {
         return 0
     fi
 
-    if ! command -v getsebool &>/dev/null || ! getsebool -a 2>/dev/null | grep -q '^httpd_can_network_connect[[:space:]]'; then
-        warn "SELinux boolean 'httpd_can_network_connect' is not available on this system. Skipping."
-        return 0
-    fi
+    # Bật httpd_can_network_connect để cho phép Nginx/PHP kết nối ra ngoài
+    info "Setting SELinux boolean: httpd_can_network_connect..."
+    sudo setsebool -P httpd_can_network_connect on || warn "Failed to set httpd_can_network_connect"
 
-    sudo setsebool -P httpd_can_network_connect on
+    # Bật nis_enabled để hỗ trợ các giao thức kết nối của PHP-FPM trên RHEL 9
+    info "Setting SELinux boolean: nis_enabled..."
+    sudo setsebool -P nis_enabled on || warn "Failed to set nis_enabled"
 }
 
 set_webroot_selinux_context() {
