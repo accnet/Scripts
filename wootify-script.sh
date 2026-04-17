@@ -265,11 +265,11 @@ install_lemp() {
     info "Optimizing PHP configuration..."
     local php_ini_path="/etc/php.ini"
     if [ -f "$php_ini_path" ]; then
-        sudo sed -i 's/^;*upload_max_filesize = .*/upload_max_filesize = 128M/' "$php_ini_path"
-        sudo sed -i 's/^;*post_max_size = .*/post_max_size = 128M/' "$php_ini_path"
+        sudo sed -i 's/^;*upload_max_filesize = .*/upload_max_filesize = 256M/' "$php_ini_path"
+        sudo sed -i 's/^;*post_max_size = .*/post_max_size = 256M/' "$php_ini_path"
         sudo sed -i 's/^;*max_execution_time = .*/max_execution_time = 600/' "$php_ini_path"
         sudo sed -i 's/^;*max_input_time = .*/max_input_time = 600/' "$php_ini_path"
-        sudo sed -i 's/^;*memory_limit = .*/memory_limit = 128M/' "$php_ini_path"
+        sudo sed -i 's/^;*memory_limit = .*/memory_limit = 256M/' "$php_ini_path"
     fi
 
     info "Optimizing Nginx configuration..."
