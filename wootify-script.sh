@@ -227,8 +227,19 @@ install_lemp() {
     info "Starting LEMP stack installation on AlmaLinux..."
     create_swap_if_needed
 
-    info "Updating system..."
+    info "Updating system and CA certificates..."
     sudo dnf update -y
+    # Đảm bảo chứng chỉ bảo mật luôn mới nhất để không lỗi SSL khi kết nối WP.org
+    sudo dnf install -y ca-certificates
+    sudo update-ca-trust
+
+    # --- BỔ SUNG: Ưu tiên IPv4 để tránh treo kết nối do IPv6 lỗi ---
+    info "Configuring system to prioritize IPv4 over IPv6..."
+    if [ -f /etc/gai.conf ]; then
+        sudo sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+    else
+        echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
+    fi
 
     if sudo dnf list installed httpd &>/dev/null; then
         warn "Detected httpd (Apache). Removing to avoid conflicts."
