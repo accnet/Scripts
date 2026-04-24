@@ -3,7 +3,7 @@
 # ==============================================================================
 # WordPress Management Script for RHEL Stack (AlmaLinux)
 #
-# Version: 4.7-RHEL + LE auto-renew
+# Version: 4.7-RHEL + LE auto-renew + checkout HTTPS fixes
 #
 # Main features:
 # - Install LEMP, create/delete/clone/list sites, install SSL, restart services.
@@ -404,7 +404,10 @@ server {
 
     location ~ \.php\$ {
         include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT \$realpath_root;
+        fastcgi_param HTTPS \$https if_not_empty;
+        fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
         fastcgi_pass unix:$fpm_sock;
     }
 
@@ -777,7 +780,7 @@ install_self_signed_ssl() {
 server {
     listen 80;
     server_name $domain www.$domain;
-    return 301 https://\$server_name\$request_uri;
+    return 301 https://$domain\$request_uri;
 }
 
 # Cấu hình HTTPS
@@ -804,7 +807,10 @@ server {
 
     location ~ \.php\$ {
         include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT \$realpath_root;
+        fastcgi_param HTTPS \$https if_not_empty;
+        fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
         fastcgi_pass unix:$fpm_sock;
     }
 
@@ -854,7 +860,8 @@ optimize_wp_cron() {
 
     local domain="${sites[$((choice - 1))]}"
     local webroot="/var/www/$domain"
-    local site_user="$domain"
+    local site_user
+    site_user=$(sanitize_username "$domain")
     local config_file="$webroot/wp-config.php"
     local cron_file="/etc/cron.d/wp-cron-$domain"
 
@@ -926,7 +933,8 @@ chmod_site_permissions() {
     fi
     local domain="${sites[$((choice - 1))]}"
     local webroot="/var/www/$domain"
-    local site_user="$domain"
+    local site_user
+    site_user=$(sanitize_username "$domain")
 
     if [ ! -d "$webroot" ]; then
         fatal_error "Webroot $webroot does not exist. Cannot set permissions."
