@@ -104,6 +104,10 @@ sed_escape_replacement() {
     printf '%s' "$1" | sed 's/[\/&]/\\&/g'
 }
 
+selinux_regex_escape_path() {
+    sed_escape_pattern "$1"
+}
+
 ensure_wp_cli() {
     if [ -x "$WP_CLI_PATH" ]; then
         return 0
@@ -148,6 +152,10 @@ allow_httpd_network_connect() {
 set_webroot_selinux_context() {
     local webroot="$1"
     local mode="${2:-add}"
+    local webroot_regex
+    local wp_content_regex
+    webroot_regex=$(selinux_regex_escape_path "$webroot")
+    wp_content_regex=$(selinux_regex_escape_path "$webroot/wp-content")
 
     if ! is_selinux_enabled; then
         warn "SELinux is disabled or unavailable. Skipping SELinux context update for $webroot."
@@ -161,15 +169,53 @@ set_webroot_selinux_context() {
 
     case "$mode" in
         add)
-            sudo semanage fcontext -a -t httpd_sys_rw_content_t "$webroot(/.*)?" || \
-                sudo semanage fcontext -m -t httpd_sys_rw_content_t "$webroot(/.*)?"
+            sudo semanage fcontext -a -t httpd_sys_content_t "${webroot_regex}(/.*)?" || \
+                sudo semanage fcontext -m -t httpd_sys_content_t "${webroot_regex}(/.*)?"
+            sudo semanage fcontext -a -t httpd_sys_rw_content_t "${wp_content_regex}(/.*)?" || \
+                sudo semanage fcontext -m -t httpd_sys_rw_content_t "${wp_content_regex}(/.*)?"
             sudo restorecon -R "$webroot"
             ;;
         delete)
-            sudo semanage fcontext -d "$webroot(/.*)?" || true
+            sudo semanage fcontext -d "${wp_content_regex}(/.*)?" || true
+            sudo semanage fcontext -d "${webroot_regex}(/.*)?" || true
             ;;
         *)
             warn "Unknown SELinux context mode '$mode' for $webroot."
+            ;;
+    esac
+}
+
+set_php_fpm_socket_selinux_context() {
+    local socket_path="$1"
+    local mode="${2:-add}"
+    local socket_regex
+    socket_regex=$(selinux_regex_escape_path "$socket_path")
+
+    if ! is_selinux_enabled; then
+        warn "SELinux is disabled or unavailable. Skipping PHP-FPM socket context update for $socket_path."
+        return 0
+    fi
+
+    if ! command -v semanage &>/dev/null || ! command -v restorecon &>/dev/null; then
+        warn "SELinux management tools are not available. Skipping PHP-FPM socket context update for $socket_path."
+        return 0
+    fi
+
+    case "$mode" in
+        add)
+            sudo semanage fcontext -a -t httpd_var_run_t "$socket_regex" || \
+                sudo semanage fcontext -m -t httpd_var_run_t "$socket_regex"
+            if [ -e "$socket_path" ]; then
+                sudo restorecon "$socket_path"
+            else
+                sudo restorecon "$(dirname "$socket_path")" || true
+            fi
+            ;;
+        delete)
+            sudo semanage fcontext -d "$socket_regex" || true
+            ;;
+        *)
+            warn "Unknown SELinux socket context mode '$mode' for $socket_path."
             ;;
     esac
 }
@@ -573,11 +619,16 @@ php_admin_value[max_execution_time] = 600
 php_admin_value[max_input_time] = 600
 EOL
 
+    info ">> SELinux: Setting context for PHP-FPM socket..."
+    set_php_fpm_socket_selinux_context "$fpm_sock"
+
     info "Checking configuration and reloading services..."
     if ! sudo nginx -t; then
         fatal_error "Nginx configuration for site $domain is invalid."
     fi
-    sudo systemctl reload nginx && sudo systemctl reload php-fpm
+    sudo systemctl reload php-fpm
+    set_php_fpm_socket_selinux_context "$fpm_sock"
+    sudo systemctl reload nginx
 
     info "Installing WordPress with WP-CLI..."
     ensure_wp_cli
@@ -711,6 +762,7 @@ delete_site() {
 
     info ">> SELinux: Removing webroot context..."
     set_webroot_selinux_context "$webroot" delete
+    set_php_fpm_socket_selinux_context "/var/run/php-fpm/${domain}.sock" delete
 
     info "Deleting system user and webroot..."
     if id -u "$site_user" >/dev/null 2>&1; then
@@ -834,8 +886,14 @@ clone_site() {
     sudo sed -i "s/user = $src_site_user/user = $new_site_user/" "$new_pool_conf"
     sudo sed -i "s|listen = /var/run/php-fpm/${src_domain_pattern}\.sock|listen = ${new_fpm_sock}|" "$new_pool_conf"
 
+    info ">> SELinux: Setting context for new PHP-FPM socket..."
+    set_php_fpm_socket_selinux_context "$new_fpm_sock"
+
     info "Reloading services..."
-    sudo nginx -t && sudo systemctl reload nginx && sudo systemctl reload php-fpm
+    sudo nginx -t
+    sudo systemctl reload php-fpm
+    set_php_fpm_socket_selinux_context "$new_fpm_sock"
+    sudo systemctl reload nginx
 
     success "Site cloned successfully!"
     echo -e "----------------------------------------"
