@@ -3,7 +3,7 @@
 # ==============================================================================
 # WordPress Management Script for RHEL Stack (AlmaLinux)
 #
-# Version: 4.7-RHEL + LE auto-renew + checkout HTTPS fixes
+# Version: 4.7-RHEL + LE auto-renew
 #
 # Main features:
 # - Install LEMP, create/delete/clone/list sites, install SSL, restart services.
@@ -55,6 +55,72 @@ sanitize_username() {
     echo "$raw" | tr 'A-Z' 'a-z' | tr '.@' '_' | tr -cd 'a-z0-9_-' | cut -c 1-32
 }
 
+normalize_domain() {
+    local raw="$1"
+    echo "$raw" | tr 'A-Z' 'a-z' | sed 's/[[:space:]]//g'
+}
+
+is_valid_domain() {
+    local domain="$1"
+    [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+is_valid_email() {
+    local email="$1"
+    [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+require_valid_domain() {
+    local domain="$1"
+    if ! is_valid_domain "$domain"; then
+        fatal_error "Invalid domain '$domain'. Use a real domain like example.com, without protocol, path, spaces, or special characters."
+    fi
+}
+
+require_valid_email() {
+    local email="$1"
+    if ! is_valid_email "$email"; then
+        fatal_error "Invalid email '$email'."
+    fi
+}
+
+generate_sql_password() {
+    openssl rand -hex 24
+}
+
+get_site_user_from_webroot() {
+    local webroot="$1"
+    if [ ! -d "$webroot" ]; then
+        fatal_error "Webroot $webroot does not exist."
+    fi
+    stat -c '%U' "$webroot"
+}
+
+sed_escape_pattern() {
+    printf '%s' "$1" | sed 's/[][\/.^$*+?{}()|]/\\&/g'
+}
+
+sed_escape_replacement() {
+    printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+ensure_wp_cli() {
+    if [ -x "$WP_CLI_PATH" ]; then
+        return 0
+    fi
+
+    if command -v wp &>/dev/null; then
+        sudo install -m 755 "$(command -v wp)" "$WP_CLI_PATH"
+        return 0
+    fi
+
+    info "WP-CLI not installed, installing now..."
+    local tmp_wp_cli="/tmp/wp-cli.phar"
+    curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$tmp_wp_cli"
+    chmod +x "$tmp_wp_cli"
+    sudo mv "$tmp_wp_cli" "$WP_CLI_PATH"
+}
+
 is_selinux_enabled() {
     if ! command -v getenforce &>/dev/null; then
         return 1
@@ -71,13 +137,12 @@ allow_httpd_network_connect() {
         return 0
     fi
 
-    # Bật httpd_can_network_connect để cho phép Nginx/PHP kết nối ra ngoài
-    info "Setting SELinux boolean: httpd_can_network_connect..."
-    sudo setsebool -P httpd_can_network_connect on || warn "Failed to set httpd_can_network_connect"
+    if ! command -v getsebool &>/dev/null || ! getsebool -a 2>/dev/null | grep -q '^httpd_can_network_connect[[:space:]]'; then
+        warn "SELinux boolean 'httpd_can_network_connect' is not available on this system. Skipping."
+        return 0
+    fi
 
-    # Bật nis_enabled để hỗ trợ các giao thức kết nối của PHP-FPM trên RHEL 9
-    info "Setting SELinux boolean: nis_enabled..."
-    sudo setsebool -P nis_enabled on || warn "Failed to set nis_enabled"
+    sudo setsebool -P httpd_can_network_connect on
 }
 
 set_webroot_selinux_context() {
@@ -227,19 +292,8 @@ install_lemp() {
     info "Starting LEMP stack installation on AlmaLinux..."
     create_swap_if_needed
 
-    info "Updating system and CA certificates..."
+    info "Updating system..."
     sudo dnf update -y
-    # Đảm bảo chứng chỉ bảo mật luôn mới nhất để không lỗi SSL khi kết nối WP.org
-    sudo dnf install -y ca-certificates
-    sudo update-ca-trust
-
-    # --- BỔ SUNG: Ưu tiên IPv4 để tránh treo kết nối do IPv6 lỗi ---
-    info "Configuring system to prioritize IPv4 over IPv6..."
-    if [ -f /etc/gai.conf ]; then
-        sudo sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
-    else
-        echo "precedence ::ffff:0:0/96  100" | sudo tee /etc/gai.conf >/dev/null
-    fi
 
     if sudo dnf list installed httpd &>/dev/null; then
         warn "Detected httpd (Apache). Removing to avoid conflicts."
@@ -265,11 +319,24 @@ install_lemp() {
     info "Optimizing PHP configuration..."
     local php_ini_path="/etc/php.ini"
     if [ -f "$php_ini_path" ]; then
-        sudo sed -i 's/^;*upload_max_filesize = .*/upload_max_filesize = 256M/' "$php_ini_path"
-        sudo sed -i 's/^;*post_max_size = .*/post_max_size = 256M/' "$php_ini_path"
+        sudo sed -i 's/^;*upload_max_filesize = .*/upload_max_filesize = 512M/' "$php_ini_path"
+        sudo sed -i 's/^;*post_max_size = .*/post_max_size = 512M/' "$php_ini_path"
         sudo sed -i 's/^;*max_execution_time = .*/max_execution_time = 600/' "$php_ini_path"
         sudo sed -i 's/^;*max_input_time = .*/max_input_time = 600/' "$php_ini_path"
-        sudo sed -i 's/^;*memory_limit = .*/memory_limit = 256M/' "$php_ini_path"
+        sudo sed -i 's/^;*memory_limit = .*/memory_limit = 512M/' "$php_ini_path"
+        sudo sed -i 's/^;*max_input_vars = .*/max_input_vars = 5000/' "$php_ini_path"
+        sudo sed -i 's/^;*realpath_cache_size = .*/realpath_cache_size = 4096K/' "$php_ini_path"
+        sudo sed -i 's/^;*realpath_cache_ttl = .*/realpath_cache_ttl = 600/' "$php_ini_path"
+    fi
+
+    local opcache_ini="/etc/php.d/10-opcache.ini"
+    if [ -f "$opcache_ini" ]; then
+        sudo sed -i 's/^;*opcache.enable=.*/opcache.enable=1/' "$opcache_ini"
+        sudo sed -i 's/^;*opcache.memory_consumption=.*/opcache.memory_consumption=192/' "$opcache_ini"
+        sudo sed -i 's/^;*opcache.interned_strings_buffer=.*/opcache.interned_strings_buffer=16/' "$opcache_ini"
+        sudo sed -i 's/^;*opcache.max_accelerated_files=.*/opcache.max_accelerated_files=20000/' "$opcache_ini"
+        sudo sed -i 's/^;*opcache.validate_timestamps=.*/opcache.validate_timestamps=1/' "$opcache_ini"
+        sudo sed -i 's/^;*opcache.revalidate_freq=.*/opcache.revalidate_freq=60/' "$opcache_ini"
     fi
 
     info "Optimizing Nginx configuration..."
@@ -290,19 +357,21 @@ install_lemp() {
     sudo systemctl enable --now nginx mariadb php-fpm crond
 
     info "Automatically configuring MariaDB security..."
-    local mariadb_root_pass
-    mariadb_root_pass=$(openssl rand -base64 16)
-
-    sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$mariadb_root_pass'; FLUSH PRIVILEGES;"
-
-    sudo tee /root/.my.cnf >/dev/null <<EOL
+    local mariadb_root_pass=""
+    if sudo test -f /root/.my.cnf && sudo mysql -e "SELECT 1;" >/dev/null 2>&1; then
+        warn "MariaDB root credentials already work from /root/.my.cnf. Keeping existing root password."
+    else
+        mariadb_root_pass=$(generate_sql_password)
+        sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$mariadb_root_pass'; FLUSH PRIVILEGES;"
+        sudo tee /root/.my.cnf >/dev/null <<EOL
 [client]
 user=root
 password="$mariadb_root_pass"
 EOL
-    sudo chmod 600 /root/.my.cnf
+        sudo chmod 600 /root/.my.cnf
+    fi
 
-    sudo mysql -u root <<EOF
+    sudo mysql <<EOF
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
@@ -310,9 +379,11 @@ DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
 EOF
     success "MariaDB has been automatically secured."
-    warn "MariaDB root password has been created and saved to /root/.my.cnf"
-    echo -e "${C_YELLOW}🔑 Your MariaDB root password is:${C_RESET} ${mariadb_root_pass}"
-    echo -e "${C_YELLOW}Please save this password in a safe place!${C_RESET}"
+    if [ -n "$mariadb_root_pass" ]; then
+        warn "MariaDB root password has been created and saved to /root/.my.cnf"
+        echo -e "${C_YELLOW}🔑 Your MariaDB root password is:${C_RESET} ${mariadb_root_pass}"
+        echo -e "${C_YELLOW}Please save this password in a safe place!${C_RESET}"
+    fi
 
     sudo touch "$LEMP_INSTALLED_FLAG"
     success "LEMP stack installation completed!"
@@ -321,13 +392,25 @@ EOF
 create_site() {
     info "Starting creation of new WordPress site..."
     read -p "Enter domain (example: mydomain.com): " domain
+    domain=$(normalize_domain "$domain")
     if [ -z "$domain" ]; then
         fatal_error "Domain cannot be empty."
     fi
+    require_valid_domain "$domain"
 
     local webroot="/var/www/$domain"
+    if [ -e "$webroot" ]; then
+        fatal_error "Webroot $webroot already exists."
+    fi
+    if [ -f "/etc/nginx/conf.d/$domain.conf" ] || [ -f "/etc/php-fpm.d/$domain.conf" ]; then
+        fatal_error "Nginx or PHP-FPM configuration for $domain already exists."
+    fi
+
     local site_user
     site_user=$(sanitize_username "$domain")
+    if [ -z "$site_user" ]; then
+        fatal_error "Could not derive a valid system username from domain '$domain'."
+    fi
 
     if ! id -u "$site_user" >/dev/null 2>&1; then
         info "Creating system user '$site_user' for site..."
@@ -346,7 +429,7 @@ create_site() {
     local db_user
     db_user=$(echo "${safe_domain}" | cut -c -23)_u${random_suffix}
     local db_pass
-    db_pass=$(openssl rand -base64 12)
+    db_pass=$(generate_sql_password)
 
     local admin_user=""
     local admin_email=""
@@ -363,6 +446,9 @@ create_site() {
         read -p "Enter WordPress admin email: " admin_email
         if [ -z "$admin_email" ]; then
             warn "Email cannot be empty. Please try again."
+        elif ! is_valid_email "$admin_email"; then
+            warn "Invalid email format. Please try again."
+            admin_email=""
         fi
     done
 
@@ -376,6 +462,7 @@ create_site() {
 
     info "Downloading and installing WordPress..."
     sudo mkdir -p "$webroot"
+    rm -rf /tmp/wordpress /tmp/latest.tar.gz
     wget -q https://wordpress.org/latest.tar.gz -O /tmp/latest.tar.gz
     tar -xzf /tmp/latest.tar.gz -C /tmp && sudo cp -r /tmp/wordpress/* "$webroot" && sudo chown -R "$site_user":nginx "$webroot"
 
@@ -398,20 +485,66 @@ server {
     root $webroot;
     index index.php index.html;
 
+    client_max_body_size 512M;
+
+    location = /favicon.ico {
+        log_not_found off;
+        access_log off;
+    }
+
+    location = /robots.txt {
+        allow all;
+        log_not_found off;
+        access_log off;
+    }
+
+    location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root $webroot;
+    }
+
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
     }
 
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
-        fastcgi_param DOCUMENT_ROOT \$realpath_root;
-        fastcgi_param HTTPS \$https if_not_empty;
-        fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
-        fastcgi_pass unix:$fpm_sock;
+    location = /xmlrpc.php {
+        deny all;
     }
 
-    location ~ /\.ht {
+    location ~* /(wp-config.php|readme.html|license.txt|\.user.ini|composer\.(json|lock)|package(-lock)?\.json)$ {
+        deny all;
+    }
+
+    location ~* /(?:uploads|files)/.*\.php\$ {
+        deny all;
+    }
+
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|webp|avif|svg|ico|woff2?|ttf|eot|otf|mp4|webm)$ {
+        expires 30d;
+        access_log off;
+        log_not_found off;
+        add_header Cache-Control "public, no-transform";
+        try_files \$uri =404;
+    }
+
+    location ~ \.php\$ {
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTPS \$https if_not_empty;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_pass unix:$fpm_sock;
+        fastcgi_read_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_connect_timeout 60;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 256 16k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
+    }
+
+    location ~ /\.(?!well-known) {
         deny all;
     }
 }
@@ -427,10 +560,17 @@ listen = $fpm_sock
 listen.owner = nginx
 listen.group = nginx
 listen.mode = 0660
-pm = ondemand
-pm.max_children = 10
-pm.process_idle_timeout = 10s
+pm = dynamic
+pm.max_children = 16
+pm.start_servers = 3
+pm.min_spare_servers = 2
+pm.max_spare_servers = 6
 pm.max_requests = 500
+php_admin_value[upload_max_filesize] = 512M
+php_admin_value[post_max_size] = 512M
+php_admin_value[memory_limit] = 512M
+php_admin_value[max_execution_time] = 600
+php_admin_value[max_input_time] = 600
 EOL
 
     info "Checking configuration and reloading services..."
@@ -440,11 +580,7 @@ EOL
     sudo systemctl reload nginx && sudo systemctl reload php-fpm
 
     info "Installing WordPress with WP-CLI..."
-    if ! command -v wp &>/dev/null; then
-        info "WP-CLI not installed, installing now..."
-        curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-        chmod +x wp-cli.phar && sudo mv wp-cli.phar "$WP_CLI_PATH"
-    fi
+    ensure_wp_cli
 
     sudo -u "$site_user" "$WP_CLI_PATH" core config --dbname="$db_name" --dbuser="$db_user" --dbpass="$db_pass" --path="$webroot" --skip-check
     sudo -u "$site_user" "$WP_CLI_PATH" core install --url="http://$domain" --title="Website $domain" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="$admin_email" --path="$webroot"
@@ -468,7 +604,8 @@ EOL
 
     info "Creating and setting permissions for WooCommerce log directory..."
     sudo -u "$site_user" mkdir -p "$webroot/wp-content/uploads/wc-logs"
-    sudo chmod -R 775 "$webroot/wp-content"
+    sudo find "$webroot/wp-content" -type d -exec chmod 775 {} +
+    sudo find "$webroot/wp-content" -type f -exec chmod 664 {} +
 
     success "Site http://$domain created successfully!"
     echo -e "----------------------------------------"
@@ -526,6 +663,7 @@ delete_site() {
         return
     fi
     local domain="${sites[$((choice - 1))]}"
+    require_valid_domain "$domain"
 
     warn "ARE YOU SURE YOU WANT TO COMPLETELY DELETE SITE '$domain'?"
     warn "This action is irreversible and will permanently delete the webroot, database, and user."
@@ -538,14 +676,27 @@ delete_site() {
     info "Starting deletion of site '$domain'..."
     local webroot="/var/www/$domain"
     local site_user
-    site_user=$(stat -c '%U' "$webroot")
+    site_user=$(get_site_user_from_webroot "$webroot")
+    ensure_wp_cli
     local db_name
     db_name=$(sudo -u "$site_user" "$WP_CLI_PATH" config get DB_NAME --path="$webroot" --skip-plugins --skip-themes)
     local db_user
     db_user=$(sudo -u "$site_user" "$WP_CLI_PATH" config get DB_USER --path="$webroot" --skip-plugins --skip-themes)
 
+    local backup_dir="/root/wp-backups/${domain}-$(date +%Y%m%d-%H%M%S)"
+    info "Creating safety backup before deletion at $backup_dir..."
+    sudo mkdir -p "$backup_dir"
+    sudo mysqldump --single-transaction --quick "$db_name" | gzip | sudo tee "$backup_dir/database.sql.gz" >/dev/null
+    sudo tar -C /var/www -czf "$backup_dir/files.tar.gz" "$domain"
+    sudo chmod -R go-rwx "$backup_dir"
+
     info "Deleting Nginx, FPM, and Cron configuration files..."
     sudo rm -f "/etc/nginx/conf.d/${domain}.conf" "/etc/php-fpm.d/${domain}.conf" "/etc/cron.d/wp-cron-${domain}"
+
+    if command -v certbot &>/dev/null; then
+        info "Deleting Let's Encrypt certificate if it exists..."
+        sudo certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
+    fi
 
     info "Reloading services..."
     sudo nginx -t && sudo systemctl reload nginx && sudo systemctl reload php-fpm
@@ -594,21 +745,32 @@ clone_site() {
     fi
 
     local src_domain="${sites[$((choice - 1))]}"
+    require_valid_domain "$src_domain"
     read -p "Enter new domain for the clone: " new_domain
+    new_domain=$(normalize_domain "$new_domain")
     if [ -z "$new_domain" ]; then
         fatal_error "New domain cannot be empty."
     fi
+    require_valid_domain "$new_domain"
     if [ -d "/var/www/$new_domain" ]; then
         fatal_error "Directory /var/www/$new_domain already exists."
+    fi
+    if [ -f "/etc/nginx/conf.d/$new_domain.conf" ] || [ -f "/etc/php-fpm.d/$new_domain.conf" ]; then
+        fatal_error "Nginx or PHP-FPM configuration for $new_domain already exists."
     fi
 
     info "Starting clone from '$src_domain' to '$new_domain'..."
     local src_webroot="/var/www/$src_domain"
     local new_webroot="/var/www/$new_domain"
     local src_site_user
-    src_site_user=$(stat -c '%U' "$src_webroot")
+    src_site_user=$(get_site_user_from_webroot "$src_webroot")
     local new_site_user
     new_site_user=$(sanitize_username "$new_domain")
+    if [ -z "$new_site_user" ]; then
+        fatal_error "Could not derive a valid system username from domain '$new_domain'."
+    fi
+
+    ensure_wp_cli
 
     local src_db_name
     src_db_name=$(sudo -u "$src_site_user" "$WP_CLI_PATH" config get DB_NAME --path="$src_webroot")
@@ -622,7 +784,7 @@ clone_site() {
     local new_db_user
     new_db_user=$(echo "${new_safe_domain}" | cut -c -23)_u${random_suffix}
     local new_db_pass
-    new_db_pass=$(openssl rand -base64 12)
+    new_db_pass=$(generate_sql_password)
 
     info "Copying files..."
     sudo cp -a "$src_webroot" "$new_webroot"
@@ -643,7 +805,7 @@ clone_site() {
     sudo mysql -e "CREATE USER IF NOT EXISTS \`$new_db_user\`@'localhost' IDENTIFIED BY '$new_db_pass';"
     sudo mysql -e "GRANT ALL PRIVILEGES ON \`$new_db_name\`.* TO \`$new_db_user\`@'localhost';"
     sudo mysql -e "FLUSH PRIVILEGES;"
-    sudo mysqldump "$src_db_name" | sudo mysql "$new_db_name"
+    sudo mysqldump --single-transaction --quick "$src_db_name" | sudo mysql "$new_db_name"
 
     info "Updating WordPress configuration (wp-config.php)..."
     sudo -u "$new_site_user" "$WP_CLI_PATH" config set DB_NAME "$new_db_name" --path="$new_webroot"
@@ -651,20 +813,26 @@ clone_site() {
     sudo -u "$new_site_user" "$WP_CLI_PATH" config set DB_PASSWORD "$new_db_pass" --path="$new_webroot"
 
     info "Replacing domain in database..."
-    sudo -u "$new_site_user" "$WP_CLI_PATH" search-replace "//$src_domain" "//$new_domain" --all-tables --skip-columns=guid --path="$new_webroot"
+    sudo -u "$new_site_user" "$WP_CLI_PATH" search-replace "$src_domain" "$new_domain" --all-tables --skip-columns=guid --precise --path="$new_webroot"
+    sudo -u "$new_site_user" "$WP_CLI_PATH" option update home "http://$new_domain" --path="$new_webroot"
+    sudo -u "$new_site_user" "$WP_CLI_PATH" option update siteurl "http://$new_domain" --path="$new_webroot"
 
     info "Creating Nginx configuration and FPM Pool for new site..."
     local new_nginx_conf="/etc/nginx/conf.d/$new_domain.conf"
     local new_fpm_sock="/var/run/php-fpm/${new_domain}.sock"
     sudo cp "/etc/nginx/conf.d/$src_domain.conf" "$new_nginx_conf"
-    sudo sed -i "s/$src_domain/$new_domain/g" "$new_nginx_conf"
-    sudo sed -i "s|/var/run/php-fpm/${src_domain}.sock|${new_fpm_sock}|" "$new_nginx_conf"
+    local src_domain_pattern
+    local new_domain_replacement
+    src_domain_pattern=$(sed_escape_pattern "$src_domain")
+    new_domain_replacement=$(sed_escape_replacement "$new_domain")
+    sudo sed -i "s/${src_domain_pattern}/${new_domain_replacement}/g" "$new_nginx_conf"
+    sudo sed -i "s|/var/run/php-fpm/${src_domain_pattern}\.sock|${new_fpm_sock}|" "$new_nginx_conf"
 
     local new_pool_conf="/etc/php-fpm.d/${new_domain}.conf"
     sudo cp "/etc/php-fpm.d/$src_domain.conf" "$new_pool_conf"
-    sudo sed -i "s/\[$src_domain\]/\[$new_domain\]/" "$new_pool_conf"
+    sudo sed -i "s/\[${src_domain_pattern}\]/\[${new_domain_replacement}\]/" "$new_pool_conf"
     sudo sed -i "s/user = $src_site_user/user = $new_site_user/" "$new_pool_conf"
-    sudo sed -i "s|listen = /var/run/php-fpm/${src_domain}.sock|listen = ${new_fpm_sock}|" "$new_pool_conf"
+    sudo sed -i "s|listen = /var/run/php-fpm/${src_domain_pattern}\.sock|listen = ${new_fpm_sock}|" "$new_pool_conf"
 
     info "Reloading services..."
     sudo nginx -t && sudo systemctl reload nginx && sudo systemctl reload php-fpm
@@ -708,6 +876,9 @@ HOOK
 install_ssl() {
     local domain=$1
     local email=$2
+    domain=$(normalize_domain "$domain")
+    require_valid_domain "$domain"
+    require_valid_email "$email"
     info "Starting SSL installation for domain: $domain"
     sudo dnf install -y certbot python3-certbot-nginx
 
@@ -715,11 +886,12 @@ install_ssl() {
         # NEW: configure auto-renew after successful issuance
         ensure_le_autorenew
 
-        info "Updating URL in WordPress to use HTTPS..."
-        local webroot="/var/www/$domain"
-        local site_user
-        site_user=$(stat -c '%U' "$webroot")
-        sudo -u "$site_user" "$WP_CLI_PATH" option update home "https://$domain" --path="$webroot"
+    info "Updating URL in WordPress to use HTTPS..."
+    local webroot="/var/www/$domain"
+    local site_user
+    site_user=$(get_site_user_from_webroot "$webroot")
+    ensure_wp_cli
+    sudo -u "$site_user" "$WP_CLI_PATH" option update home "https://$domain" --path="$webroot"
         sudo -u "$site_user" "$WP_CLI_PATH" option update siteurl "https://$domain" --path="$webroot"
         success "SSL installation for https://$domain successful!"
         return 0
@@ -749,6 +921,7 @@ install_self_signed_ssl() {
         return
     fi
     local domain="${sites[$((choice - 1))]}"
+    require_valid_domain "$domain"
 
     info "Đang cài đặt cho tên miền: $domain"
 
@@ -780,7 +953,7 @@ install_self_signed_ssl() {
 server {
     listen 80;
     server_name $domain www.$domain;
-    return 301 https://$domain\$request_uri;
+    return 301 https://\$server_name\$request_uri;
 }
 
 # Cấu hình HTTPS
@@ -789,6 +962,8 @@ server {
     server_name $domain www.$domain;
     root $webroot;
     index index.php index.html;
+
+    client_max_body_size 512M;
 
     ssl_certificate $cert_path;
     ssl_certificate_key $key_path;
@@ -801,20 +976,64 @@ server {
     ssl_session_timeout 10m;
     ssl_session_tickets off;
 
+    location = /favicon.ico {
+        log_not_found off;
+        access_log off;
+    }
+
+    location = /robots.txt {
+        allow all;
+        log_not_found off;
+        access_log off;
+    }
+
+    location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root $webroot;
+    }
+
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
     }
 
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
-        fastcgi_param DOCUMENT_ROOT \$realpath_root;
-        fastcgi_param HTTPS \$https if_not_empty;
-        fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
-        fastcgi_pass unix:$fpm_sock;
+    location = /xmlrpc.php {
+        deny all;
     }
 
-    location ~ /\.ht {
+    location ~* /(wp-config.php|readme.html|license.txt|\.user.ini|composer\.(json|lock)|package(-lock)?\.json)$ {
+        deny all;
+    }
+
+    location ~* /(?:uploads|files)/.*\.php\$ {
+        deny all;
+    }
+
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|webp|avif|svg|ico|woff2?|ttf|eot|otf|mp4|webm)$ {
+        expires 30d;
+        access_log off;
+        log_not_found off;
+        add_header Cache-Control "public, no-transform";
+        try_files \$uri =404;
+    }
+
+    location ~ \.php\$ {
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTPS \$https if_not_empty;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_pass unix:$fpm_sock;
+        fastcgi_read_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_connect_timeout 60;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 256 16k;
+        fastcgi_busy_buffers_size 256k;
+        fastcgi_temp_file_write_size 256k;
+    }
+
+    location ~ /\.(?!well-known) {
         deny all;
     }
 }
@@ -829,7 +1048,8 @@ EOL
 
     info "Cập nhật đường dẫn trong WordPress sang HTTPS..."
     local site_user
-    site_user=$(stat -c '%U' "$webroot")
+    site_user=$(get_site_user_from_webroot "$webroot")
+    ensure_wp_cli
     sudo -u "$site_user" "$WP_CLI_PATH" option update home "https://$domain" --path="$webroot"
     sudo -u "$site_user" "$WP_CLI_PATH" option update siteurl "https://$domain" --path="$webroot"
 
@@ -859,14 +1079,16 @@ optimize_wp_cron() {
     fi
 
     local domain="${sites[$((choice - 1))]}"
+    require_valid_domain "$domain"
     local webroot="/var/www/$domain"
     local site_user
-    site_user=$(sanitize_username "$domain")
+    site_user=$(get_site_user_from_webroot "$webroot")
+    ensure_wp_cli
     local config_file="$webroot/wp-config.php"
     local cron_file="/etc/cron.d/wp-cron-$domain"
 
     info "Disabling default WP-Cron in wp-config.php..."
-    if grep -q "DISABLE_WP_CRON" "$config_file"; then
+    if sudo grep -q "DISABLE_WP_CRON" "$config_file"; then
         warn "WP-Cron is already disabled in wp-config.php."
     else
         sudo sed -i "/\/\* That's all, stop editing!/i define('DISABLE_WP_CRON', true);" "$config_file"
@@ -932,9 +1154,10 @@ chmod_site_permissions() {
         return
     fi
     local domain="${sites[$((choice - 1))]}"
+    require_valid_domain "$domain"
     local webroot="/var/www/$domain"
     local site_user
-    site_user=$(sanitize_username "$domain")
+    site_user=$(get_site_user_from_webroot "$webroot")
 
     if [ ! -d "$webroot" ]; then
         fatal_error "Webroot $webroot does not exist. Cannot set permissions."
@@ -949,6 +1172,7 @@ chmod_site_permissions() {
 
     # Set specific permissions for wp-content/uploads (required for media uploads)
     info "Setting specific permissions for wp-content/uploads to 775..."
+    sudo install -d -m 775 -o "$site_user" -g nginx "$webroot/wp-content/uploads"
     sudo find "$webroot/wp-content/uploads" -type d -exec chmod 775 {} +
     sudo find "$webroot/wp-content/uploads" -type f -exec chmod 664 {} +
 
@@ -987,8 +1211,28 @@ install_redis() {
     info "Enabling and starting the Redis service..."
     sudo systemctl enable --now redis
 
+    if [ -f /etc/redis/redis.conf ] && ! grep -q '^maxmemory-policy ' /etc/redis/redis.conf; then
+        echo 'maxmemory-policy allkeys-lru' | sudo tee -a /etc/redis/redis.conf >/dev/null
+        sudo systemctl restart redis
+    fi
+
     info "Restarting PHP-FPM to load the new Redis extension..."
     sudo systemctl restart php-fpm
+
+    if [ -d /etc/nginx/conf.d ]; then
+        ensure_wp_cli
+        local sites_path="/etc/nginx/conf.d"
+        local sites
+        sites=($(find "$sites_path" -maxdepth 1 -type f -name "*.conf" ! -name "php-fpm.conf" -printf "%f\n" | sed 's/\.conf$//'))
+        for domain in "${sites[@]}"; do
+            local webroot="/var/www/$domain"
+            [ -f "$webroot/wp-config.php" ] || continue
+            local site_user
+            site_user=$(get_site_user_from_webroot "$webroot")
+            sudo -u "$site_user" "$WP_CLI_PATH" plugin install redis-cache --activate --path="$webroot" || true
+            sudo -u "$site_user" "$WP_CLI_PATH" redis enable --path="$webroot" || true
+        done
+    fi
 
     success "Redis and the PHP-Redis extension have been installed successfully!"
     info "You can verify the PHP module with: php --ri redis"
@@ -1037,7 +1281,14 @@ main_menu() {
             fi
 
             local ssl_domain="${sites[$((ssl_choice - 1))]}"
-            read -p "Enter your email: " ssl_email
+            local ssl_email=""
+            while [ -z "$ssl_email" ]; do
+                read -p "Enter your email: " ssl_email
+                if ! is_valid_email "$ssl_email"; then
+                    menu_error "Invalid email format."
+                    ssl_email=""
+                fi
+            done
             install_ssl "$ssl_domain" "$ssl_email" || true
             ;;
         5) list_sites ;;
