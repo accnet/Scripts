@@ -9,7 +9,6 @@
 # - Install LEMP, create/delete/clone/list sites, install SSL, restart services.
 # - Use EPEL & Remi repositories, automatic firewalld management.
 # - Automated MariaDB security configuration, create and save root password.
-# - Automatic SELinux context handling for webroot and socket.
 # - Create separate FPM Pool and system user for each site to enhance security.
 # - Auto-renew Let's Encrypt certificates (systemd timer if available, else cron).
 # ==============================================================================
@@ -104,10 +103,6 @@ sed_escape_replacement() {
     printf '%s' "$1" | sed 's/[\/&]/\\&/g'
 }
 
-selinux_regex_escape_path() {
-    sed_escape_pattern "$1"
-}
-
 ensure_wp_cli() {
     if [ -x "$WP_CLI_PATH" ]; then
         return 0
@@ -123,101 +118,6 @@ ensure_wp_cli() {
     curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$tmp_wp_cli"
     chmod +x "$tmp_wp_cli"
     sudo mv "$tmp_wp_cli" "$WP_CLI_PATH"
-}
-
-is_selinux_enabled() {
-    if ! command -v getenforce &>/dev/null; then
-        return 1
-    fi
-
-    [ "$(getenforce 2>/dev/null)" != "Disabled" ]
-}
-
-allow_httpd_network_connect() {
-    info ">> SELinux: Allowing web server to make network connections..."
-
-    if ! is_selinux_enabled; then
-        warn "SELinux is disabled or unavailable. Skipping SELinux boolean configuration."
-        return 0
-    fi
-
-    if ! command -v getsebool &>/dev/null || ! getsebool -a 2>/dev/null | grep -q '^httpd_can_network_connect[[:space:]]'; then
-        warn "SELinux boolean 'httpd_can_network_connect' is not available on this system. Skipping."
-        return 0
-    fi
-
-    sudo setsebool -P httpd_can_network_connect on
-}
-
-set_webroot_selinux_context() {
-    local webroot="$1"
-    local mode="${2:-add}"
-    local webroot_regex
-    local wp_content_regex
-    webroot_regex=$(selinux_regex_escape_path "$webroot")
-    wp_content_regex=$(selinux_regex_escape_path "$webroot/wp-content")
-
-    if ! is_selinux_enabled; then
-        warn "SELinux is disabled or unavailable. Skipping SELinux context update for $webroot."
-        return 0
-    fi
-
-    if ! command -v semanage &>/dev/null || ! command -v restorecon &>/dev/null; then
-        warn "SELinux management tools are not available. Skipping SELinux context update for $webroot."
-        return 0
-    fi
-
-    case "$mode" in
-        add)
-            sudo semanage fcontext -a -t httpd_sys_content_t "${webroot_regex}(/.*)?" || \
-                sudo semanage fcontext -m -t httpd_sys_content_t "${webroot_regex}(/.*)?"
-            sudo semanage fcontext -a -t httpd_sys_rw_content_t "${wp_content_regex}(/.*)?" || \
-                sudo semanage fcontext -m -t httpd_sys_rw_content_t "${wp_content_regex}(/.*)?"
-            sudo restorecon -R "$webroot"
-            ;;
-        delete)
-            sudo semanage fcontext -d "${wp_content_regex}(/.*)?" || true
-            sudo semanage fcontext -d "${webroot_regex}(/.*)?" || true
-            ;;
-        *)
-            warn "Unknown SELinux context mode '$mode' for $webroot."
-            ;;
-    esac
-}
-
-set_php_fpm_socket_selinux_context() {
-    local socket_path="$1"
-    local mode="${2:-add}"
-    local socket_regex
-    socket_regex=$(selinux_regex_escape_path "$socket_path")
-
-    if ! is_selinux_enabled; then
-        warn "SELinux is disabled or unavailable. Skipping PHP-FPM socket context update for $socket_path."
-        return 0
-    fi
-
-    if ! command -v semanage &>/dev/null || ! command -v restorecon &>/dev/null; then
-        warn "SELinux management tools are not available. Skipping PHP-FPM socket context update for $socket_path."
-        return 0
-    fi
-
-    case "$mode" in
-        add)
-            sudo semanage fcontext -a -t httpd_var_run_t "$socket_regex" || \
-                sudo semanage fcontext -m -t httpd_var_run_t "$socket_regex"
-            if [ -e "$socket_path" ]; then
-                sudo restorecon "$socket_path"
-            else
-                sudo restorecon "$(dirname "$socket_path")" || true
-            fi
-            ;;
-        delete)
-            sudo semanage fcontext -d "$socket_regex" || true
-            ;;
-        *)
-            warn "Unknown SELinux socket context mode '$mode' for $socket_path."
-            ;;
-    esac
 }
 
 configure_nftables_fallback() {
@@ -243,7 +143,15 @@ configure_nftables_fallback() {
         sudo nft add rule inet filter input tcp dport 443 accept
     fi
 
-    success "Opened HTTP/HTTPS ports with nftables."
+    # Persist nftables rules across reboots
+    if [ -d /etc/nftables ]; then
+        sudo nft list ruleset | sudo tee /etc/nftables/wootify.nft >/dev/null
+    elif [ -f /etc/nftables.conf ]; then
+        sudo nft list ruleset | sudo tee /etc/nftables.conf >/dev/null
+    fi
+    sudo systemctl enable --now nftables 2>/dev/null || true
+
+    success "Opened HTTP/HTTPS ports with nftables (rules persisted)."
     return 0
 }
 
@@ -262,8 +170,14 @@ configure_iptables_fallback() {
         sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
     fi
 
-    success "Opened HTTP/HTTPS ports with iptables."
-    warn "iptables rules were applied in runtime only. Save them manually if you need persistence after reboot."
+    # Persist iptables rules across reboots
+    if command -v iptables-save &>/dev/null; then
+        sudo iptables-save | sudo tee /etc/sysconfig/iptables >/dev/null 2>&1 || \
+            sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null 2>&1 || true
+    fi
+    sudo systemctl enable --now iptables 2>/dev/null || true
+
+    success "Opened HTTP/HTTPS ports with iptables (rules persisted)."
     return 0
 }
 
@@ -287,8 +201,28 @@ configure_firewall() {
 
     if ! sudo systemctl is-active --quiet firewalld; then
         warn "firewalld is installed but not running. Attempting to start service..."
+
+        # Try switching backend if current one is unavailable
+        if [ -f /etc/firewalld/firewalld.conf ]; then
+            local current_backend
+            current_backend=$(grep -oP '(?<=^FirewallBackend=)\S+' /etc/firewalld/firewalld.conf 2>/dev/null || echo "nftables")
+            if [ "$current_backend" = "nftables" ] && ! command -v nft &>/dev/null; then
+                info "nftables not found, switching firewalld backend to iptables..."
+                sudo sed -i 's/^FirewallBackend=.*/FirewallBackend=iptables/' /etc/firewalld/firewalld.conf
+            elif [ "$current_backend" = "iptables" ] && ! command -v iptables &>/dev/null; then
+                info "iptables not found, switching firewalld backend to nftables..."
+                sudo sed -i 's/^FirewallBackend=.*/FirewallBackend=nftables/' /etc/firewalld/firewalld.conf
+            fi
+        fi
+
         if ! sudo systemctl start firewalld; then
             warn "Could not start firewalld. Trying fallback firewall configuration."
+            # Apply permanent rules via offline tool so they take effect if firewalld starts later
+            if command -v firewall-offline-cmd &>/dev/null; then
+                info "Applying rules via firewall-offline-cmd for future firewalld starts..."
+                sudo firewall-offline-cmd --add-service=http 2>/dev/null || true
+                sudo firewall-offline-cmd --add-service=https 2>/dev/null || true
+            fi
             configure_nftables_fallback || configure_iptables_fallback || warn "HTTP/HTTPS ports were not opened automatically."
             return 0
         fi
@@ -338,6 +272,19 @@ install_lemp() {
     info "Starting LEMP stack installation on AlmaLinux..."
     create_swap_if_needed
 
+    info "Disabling SELinux to avoid permission conflicts..."
+    if command -v getenforce &>/dev/null; then
+        if [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+            sudo setenforce 0
+            success "SELinux set to Permissive (runtime)."
+        fi
+    fi
+    if [ -f /etc/selinux/config ]; then
+        sudo sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+        sudo sed -i 's/^SELINUX=permissive/SELINUX=disabled/' /etc/selinux/config
+        success "SELinux permanently disabled in /etc/selinux/config (takes effect after reboot)."
+    fi
+
     info "Updating system..."
     sudo dnf update -y
 
@@ -360,7 +307,7 @@ install_lemp() {
     sudo dnf install -y nginx mariadb-server php php-fpm php-mysqlnd php-curl \
         php-xml php-mbstring php-zip php-gd php-intl php-bcmath php-soap \
         php-exif php-opcache php-cli php-readline wget unzip \
-        policycoreutils-python-utils openssl cronie
+        openssl cronie
 
     info "Optimizing PHP configuration..."
     local php_ini_path="/etc/php.ini"
@@ -396,8 +343,6 @@ install_lemp() {
     fi
 
     configure_firewall
-
-    allow_httpd_network_connect
 
     info "Starting and enabling main services..."
     sudo systemctl enable --now nginx mariadb php-fpm crond
@@ -512,9 +457,6 @@ create_site() {
     wget -q https://wordpress.org/latest.tar.gz -O /tmp/latest.tar.gz
     tar -xzf /tmp/latest.tar.gz -C /tmp && sudo cp -r /tmp/wordpress/* "$webroot" && sudo chown -R "$site_user":nginx "$webroot"
 
-    info ">> SELinux: Setting context for webroot..."
-    set_webroot_selinux_context "$webroot"
-
     info "Creating Database and User..."
     sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     sudo mysql -e "CREATE USER IF NOT EXISTS \`$db_user\`@'localhost' IDENTIFIED BY '$db_pass';"
@@ -532,6 +474,12 @@ server {
     index index.php index.html;
 
     client_max_body_size 512M;
+
+    # WooCommerce & WordPress cache bypass
+    set \$skip_cache 0;
+    if (\$request_method = POST) { set \$skip_cache 1; }
+    if (\$request_uri ~* "(/cart|/checkout|/my-account|/wc-api/)") { set \$skip_cache 1; }
+    if (\$http_cookie ~* "wordpress_logged_in|woocommerce_cart|woocommerce_session|woocommerce_items_in_cart") { set \$skip_cache 1; }
 
     location = /favicon.ico {
         log_not_found off;
@@ -580,6 +528,8 @@ server {
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param HTTPS \$https if_not_empty;
         fastcgi_param HTTP_PROXY "";
+        fastcgi_cache_bypass \$skip_cache;
+        fastcgi_no_cache \$skip_cache;
         fastcgi_pass unix:$fpm_sock;
         fastcgi_read_timeout 300;
         fastcgi_send_timeout 300;
@@ -619,15 +569,11 @@ php_admin_value[max_execution_time] = 600
 php_admin_value[max_input_time] = 600
 EOL
 
-    info ">> SELinux: Setting context for PHP-FPM socket..."
-    set_php_fpm_socket_selinux_context "$fpm_sock"
-
     info "Checking configuration and reloading services..."
     if ! sudo nginx -t; then
         fatal_error "Nginx configuration for site $domain is invalid."
     fi
     sudo systemctl reload php-fpm
-    set_php_fpm_socket_selinux_context "$fpm_sock"
     sudo systemctl reload nginx
 
     info "Installing WordPress with WP-CLI..."
@@ -635,6 +581,12 @@ EOL
 
     sudo -u "$site_user" "$WP_CLI_PATH" core config --dbname="$db_name" --dbuser="$db_user" --dbpass="$db_pass" --path="$webroot" --skip-check
     sudo -u "$site_user" "$WP_CLI_PATH" core install --url="http://$domain" --title="Website $domain" --admin_user="$admin_user" --admin_password="$admin_pass" --admin_email="$admin_email" --path="$webroot"
+
+    info "Configuring direct filesystem access for plugin/theme installation..."
+    sudo -u "$site_user" "$WP_CLI_PATH" config set FS_METHOD direct --path="$webroot"
+    sudo chown -R "$site_user":nginx "$webroot/wp-content"
+    sudo find "$webroot/wp-content" -type d -exec chmod 775 {} +
+    sudo find "$webroot/wp-content" -type f -exec chmod 664 {} +
 
     info "Installing and activating desired plugins..."
     sudo -u "$site_user" "$WP_CLI_PATH" plugin install contact-form-7 woocommerce classic-editor classic-widgets autoptimize wp-fastest-cache wp-mail-smtp redis-cache --activate --path="$webroot"
@@ -657,6 +609,11 @@ EOL
     sudo -u "$site_user" mkdir -p "$webroot/wp-content/uploads/wc-logs"
     sudo find "$webroot/wp-content" -type d -exec chmod 775 {} +
     sudo find "$webroot/wp-content" -type f -exec chmod 664 {} +
+
+    info "Creating Autoptimize cache directory..."
+    sudo mkdir -p "$webroot/wp-content/cache/autoptimize"
+    sudo chown -R "$site_user":nginx "$webroot/wp-content/cache"
+    sudo chmod -R 775 "$webroot/wp-content/cache"
 
     success "Site http://$domain created successfully!"
     echo -e "----------------------------------------"
@@ -760,10 +717,6 @@ delete_site() {
     sudo pkill -u "$site_user" || true
     sleep 1
 
-    info ">> SELinux: Removing webroot context..."
-    set_webroot_selinux_context "$webroot" delete
-    set_php_fpm_socket_selinux_context "/var/run/php-fpm/${domain}.sock" delete
-
     info "Deleting system user and webroot..."
     if id -u "$site_user" >/dev/null 2>&1; then
         sudo userdel -r "$site_user"
@@ -849,9 +802,6 @@ clone_site() {
     fi
     sudo chown -R "$new_site_user":nginx "$new_webroot"
 
-    info ">> SELinux: Assigning context for new webroot..."
-    set_webroot_selinux_context "$new_webroot"
-
     info "Creating and copying database..."
     sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$new_db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     sudo mysql -e "CREATE USER IF NOT EXISTS \`$new_db_user\`@'localhost' IDENTIFIED BY '$new_db_pass';"
@@ -886,13 +836,9 @@ clone_site() {
     sudo sed -i "s/user = $src_site_user/user = $new_site_user/" "$new_pool_conf"
     sudo sed -i "s|listen = /var/run/php-fpm/${src_domain_pattern}\.sock|listen = ${new_fpm_sock}|" "$new_pool_conf"
 
-    info ">> SELinux: Setting context for new PHP-FPM socket..."
-    set_php_fpm_socket_selinux_context "$new_fpm_sock"
-
     info "Reloading services..."
     sudo nginx -t
     sudo systemctl reload php-fpm
-    set_php_fpm_socket_selinux_context "$new_fpm_sock"
     sudo systemctl reload nginx
 
     success "Site cloned successfully!"
@@ -1034,6 +980,12 @@ server {
     ssl_session_timeout 10m;
     ssl_session_tickets off;
 
+    # WooCommerce & WordPress cache bypass
+    set \$skip_cache 0;
+    if (\$request_method = POST) { set \$skip_cache 1; }
+    if (\$request_uri ~* "(/cart|/checkout|/my-account|/wc-api/)") { set \$skip_cache 1; }
+    if (\$http_cookie ~* "wordpress_logged_in|woocommerce_cart|woocommerce_session|woocommerce_items_in_cart") { set \$skip_cache 1; }
+
     location = /favicon.ico {
         log_not_found off;
         access_log off;
@@ -1081,6 +1033,8 @@ server {
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param HTTPS \$https if_not_empty;
         fastcgi_param HTTP_PROXY "";
+        fastcgi_cache_bypass \$skip_cache;
+        fastcgi_no_cache \$skip_cache;
         fastcgi_pass unix:$fpm_sock;
         fastcgi_read_timeout 300;
         fastcgi_send_timeout 300;
@@ -1234,13 +1188,15 @@ chmod_site_permissions() {
     sudo find "$webroot/wp-content/uploads" -type d -exec chmod 775 {} +
     sudo find "$webroot/wp-content/uploads" -type f -exec chmod 664 {} +
 
+    # Ensure Autoptimize cache directory exists and is writable
+    info "Ensuring Autoptimize cache directory is writable..."
+    sudo mkdir -p "$webroot/wp-content/cache/autoptimize"
+    sudo chown -R "$site_user":nginx "$webroot/wp-content/cache"
+    sudo chmod -R 775 "$webroot/wp-content/cache"
+
     # Ensure ownership is correct
     info "Ensuring correct ownership for $webroot (user: $site_user, group: nginx)..."
     sudo chown -R "$site_user":nginx "$webroot"
-
-    # Set SELinux context (already handled during site creation, but good to re-apply)
-    info ">> SELinux: Re-applying context for webroot..."
-    set_webroot_selinux_context "$webroot"
 
     success "Permissions for site '$domain' have been set to recommended WordPress values."
     warn "It's always recommended to check your specific WordPress setup for any custom permission requirements."
